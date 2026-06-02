@@ -336,7 +336,13 @@ async function handleSdkRoute(
   const completion = await createCursorSdkCompletion(env, deps, apiKey, {
     prompt: prepared.prompt,
     model: prepared.cursorModel,
-    sessionKey: sessionAffinity(request),
+    // /v1/chat/completions is STATELESS: the client resends the full message history
+    // every turn. Reusing a per-session SDK agent (via a stable client session header
+    // like OpenCode's x-opencode-session-id) re-feeds the whole conversation to an agent
+    // that already holds it, and the bridge run hangs until the 120s timeout. So chat uses
+    // a fresh session per request (no reuse, full prompt = correct). Responses keep
+    // affinity for previous_response_id continuity.
+    sessionKey: kind === "chat" ? `chat-${crypto.randomUUID()}` : sessionAffinity(request),
     sessionOwnerKey: sdkSessionOwner(apiKey),
     workingDirectory: prepared.toolContext?.workingDirectory,
     clientTools: prepared.tools,
