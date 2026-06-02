@@ -109,6 +109,10 @@ export async function createCursorSdkCompletion(
     clientTools?: ClientToolSpec[];
     requiresLocalTool?: boolean;
     allowToolCall?: (toolCall: CursorToolCall) => ToolCallDecision;
+    // Optional delta for a follow-up turn. When the bridge's agent for this session is
+    // still cached, the bridge sends only this (the new turn) instead of re-feeding the
+    // full prompt; if the agent was evicted it falls back to `prompt`, so this is safe.
+    incrementalPrompt?: { text: string; images?: CursorImage[] };
   }
 ): Promise<CursorSdkCompletion> {
   const now = deps.now();
@@ -131,7 +135,8 @@ export async function createCursorSdkCompletion(
     workingDirectory: input.workingDirectory,
     clientTools: input.clientTools,
     requiresLocalTool: input.requiresLocalTool === true,
-    allowToolCall: input.allowToolCall
+    allowToolCall: input.allowToolCall,
+    incrementalPrompt: input.incrementalPrompt ? sdkPrompt(input.incrementalPrompt) : undefined
   };
 
   if (hasCursorSdkBridge(env)) {
@@ -282,6 +287,7 @@ async function* streamCursorLocalSdkRunWithRetry(
     clientTools?: ClientToolSpec[];
     requiresLocalTool: boolean;
     allowToolCall?: (toolCall: CursorToolCall) => ToolCallDecision;
+    incrementalPrompt?: string;
   }
 ): AsyncGenerator<CursorTextEvent> {
   if (!input.requiresLocalTool && !input.allowToolCall) {
@@ -383,6 +389,7 @@ async function* streamCursorLocalSdkBridgeRunWithRetry(
     clientTools?: ClientToolSpec[];
     requiresLocalTool: boolean;
     allowToolCall?: (toolCall: CursorToolCall) => ToolCallDecision;
+    incrementalPrompt?: string;
   }
 ): AsyncGenerator<CursorTextEvent> {
   if (!input.requiresLocalTool && !input.allowToolCall) {
@@ -507,6 +514,7 @@ async function cursorLocalSdkBridgeJson(
     modelId: string;
     workingDirectory?: string;
     clientTools?: ClientToolSpec[];
+    incrementalPrompt?: string;
   }
 ): Promise<CursorSdkBridgeOutput> {
   const body = JSON.stringify({
@@ -514,6 +522,7 @@ async function cursorLocalSdkBridgeJson(
     requestId: input.runId,
     model: input.modelId,
     prompt: input.prompt,
+    incrementalPrompt: input.incrementalPrompt,
     sessionKey: input.sessionKey || input.agentId,
     workingDirectory: sdkWorkingDirectory(input.workingDirectory),
     tools: bridgeClientTools(input.clientTools)

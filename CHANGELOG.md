@@ -2,6 +2,20 @@
 
 All notable changes to the Windows app. Versions are the app/installer version.
 
+## 0.1.2 — 2026-06-02
+
+### Improved
+- **Multi-turn reliability.** Two changes resolve the occasional single-message
+  `Cursor SDK bridge run timed out` noted as a known issue in 0.1.1:
+  - **Session kept "under the hood".** Chat now reuses one `@cursor/sdk` agent per client
+    session and sends only the **new turn** (`incrementalPrompt`) to it, instead of
+    re-feeding the whole conversation. The bridge falls back to the full prompt if the agent
+    was evicted, so context is never lost. (Threads `incrementalPrompt` through
+    `worker/cursor-sdk.ts`.)
+  - **Transparent auto-retry.** A transient bridge stall *before any output* now retries
+    automatically with a fresh session + full prompt, instead of surfacing to the client — so
+    the previous manual "try again" is no longer needed.
+
 ## 0.1.1 — 2026-06-02
 
 ### Fixed

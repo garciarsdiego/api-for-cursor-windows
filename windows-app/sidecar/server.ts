@@ -50,7 +50,7 @@ import {
   type OpenAiToolSpec,
   type ToolCallContext
 } from "../../worker/openai";
-import { collectCursorOutput } from "../../worker/cursor";
+import { collectCursorOutput, type CursorTextEvent } from "../../worker/cursor";
 import { createCursorSdkCompletion, collectCursorSdkOutput } from "../../worker/cursor-sdk";
 import { encodeSse } from "../../worker/sse";
 import type { Deps, Env } from "../../worker/types";
@@ -206,7 +206,7 @@ async function handleChatCompletions(request: Request): Promise<Response> {
   const created = Math.floor(deps.now().getTime() / 1000);
 
   if (hasSdkBridge()) {
-    return handleSdkRoute("chat", request, prepared, apiKey, id, created);
+    return handleSdkRoute("chat", request, prepared, apiKey, id, created, chatIncrementalPrompt(body, cursorModel));
   }
 
   const completion = await createCursorCompletion(env, deps, apiKey, {
@@ -325,43 +325,134 @@ async function handleResponses(request: Request): Promise<Response> {
 
 type PreparedRequest = ReturnType<typeof prepareChatRequest> | ReturnType<typeof prepareResponsesRequest>;
 
+/**
+ * Transient SDK failures worth a transparent retry: the bridge does NOT auto-retry a run
+ * timeout, and a freshly created SDK agent occasionally stalls on the handshake / first
+ * token to Cursor's backend. We only retry when this happens *before any output*.
+ */
+function isTransientSdkError(error: unknown): boolean {
+  const message = (error instanceof Error ? error.message : String(error ?? "")).toLowerCase();
+  const status = (error as { status?: number } | null)?.status;
+  const code = (error as { code?: string } | null)?.code;
+  return (
+    code === "cursor_sdk_timeout" ||
+    status === 502 ||
+    status === 503 ||
+    status === 504 ||
+    message.includes("timed out") ||
+    message.includes("timeout") ||
+    message.includes("unable to connect")
+  );
+}
+
+/**
+ * Wrap an SDK event stream so a transient failure *before any event is emitted* retries
+ * with a fresh attempt (the factory decides what changes per attempt). Once any event has
+ * been yielded we never retry, so partial output is never duplicated.
+ */
+function retryingSdkStream(
+  make: (attempt: number) => Promise<AsyncIterable<CursorTextEvent>>,
+  maxAttempts = 2
+): AsyncIterable<CursorTextEvent> {
+  return {
+    async *[Symbol.asyncIterator]() {
+      for (let attempt = 0; ; attempt += 1) {
+        const iterator = (await make(attempt))[Symbol.asyncIterator]();
+        let emitted = false;
+        try {
+          for (;;) {
+            const next = await iterator.next();
+            if (next.done) return;
+            emitted = true;
+            yield next.value;
+          }
+        } catch (error) {
+          try {
+            await iterator.return?.();
+          } catch {
+            /* ignore */
+          }
+          if (!emitted && attempt + 1 < maxAttempts && isTransientSdkError(error)) continue;
+          throw error;
+        }
+      }
+    }
+  };
+}
+
+/**
+ * The incremental "new turn" for a follow-up chat request: every message after the last
+ * assistant message. Returned as a CursorPrompt so a still-cached SDK agent receives only
+ * the new turn instead of the whole conversation. Undefined on the first turn (no prior
+ * assistant) — then the bridge uses the full prompt.
+ */
+function chatIncrementalPrompt(
+  body: unknown,
+  cursorModel: string
+): ReturnType<typeof prepareChatRequest>["prompt"] | undefined {
+  const messages = (body as { messages?: Array<{ role?: string }> } | null)?.messages;
+  if (!Array.isArray(messages) || messages.length === 0) return undefined;
+  let lastAssistant = -1;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i]?.role === "assistant") {
+      lastAssistant = i;
+      break;
+    }
+  }
+  if (lastAssistant < 0 || lastAssistant >= messages.length - 1) return undefined;
+  const tail = messages.slice(lastAssistant + 1);
+  try {
+    const deltaBody = { ...(body as Record<string, unknown>), messages: tail, stream: false };
+    return prepareChatRequest(deltaBody as Parameters<typeof prepareChatRequest>[0], cursorModel).prompt;
+  } catch {
+    return undefined;
+  }
+}
+
 async function handleSdkRoute(
   kind: "chat" | "responses",
   request: Request,
   prepared: PreparedRequest,
   apiKey: string,
   id: string,
-  created: number
+  created: number,
+  incrementalPrompt?: ReturnType<typeof prepareChatRequest>["prompt"]
 ): Promise<Response> {
-  const completion = await createCursorSdkCompletion(env, deps, apiKey, {
-    prompt: prepared.prompt,
-    model: prepared.cursorModel,
-    // /v1/chat/completions is STATELESS: the client resends the full message history
-    // every turn. Reusing a per-session SDK agent (via a stable client session header
-    // like OpenCode's x-opencode-session-id) re-feeds the whole conversation to an agent
-    // that already holds it, and the bridge run hangs until the 120s timeout. So chat uses
-    // a fresh session per request (no reuse, full prompt = correct). Responses keep
-    // affinity for previous_response_id continuity.
-    sessionKey: kind === "chat" ? `chat-${crypto.randomUUID()}` : sessionAffinity(request),
-    sessionOwnerKey: sdkSessionOwner(apiKey),
-    workingDirectory: prepared.toolContext?.workingDirectory,
-    clientTools: prepared.tools,
-    requiresLocalTool: prepared.requiresLocalTool,
-    allowToolCall: (toolCall) => {
-      if (!prepared.tools.length) return "No client tool inventory was available for this request.";
-      const toolCalls = toOpenAiToolCalls({
-        toolCalls: [toolCall],
-        tools: prepared.tools,
-        responseId: "probe",
-        context: prepared.toolContext
-      });
-      return toolCalls.length > 0
-        || toolCallRetryHint({ toolCall, tools: prepared.tools, context: prepared.toolContext });
-    }
-  });
+  // Maintain one SDK agent per client session "under the hood": attempt 0 reuses the
+  // session (stable affinity key) and sends only the new turn (incrementalPrompt). The
+  // bridge re-feeds nothing while the agent is still cached and falls back to the full
+  // prompt if it was evicted, so context is never lost. A transparent retry (attempt >= 1)
+  // uses a FRESH session + the full prompt, so a transient bridge stall ("run timed out")
+  // self-recovers instead of surfacing to the client.
+  const baseSessionKey = sessionAffinity(request);
+  const makeStream = async (attempt: number): Promise<AsyncIterable<CursorTextEvent>> => {
+    const completion = await createCursorSdkCompletion(env, deps, apiKey, {
+      prompt: prepared.prompt,
+      model: prepared.cursorModel,
+      sessionKey: attempt === 0 ? baseSessionKey : `retry-${crypto.randomUUID()}`,
+      sessionOwnerKey: sdkSessionOwner(apiKey),
+      incrementalPrompt: attempt === 0 ? incrementalPrompt : undefined,
+      workingDirectory: prepared.toolContext?.workingDirectory,
+      clientTools: prepared.tools,
+      requiresLocalTool: prepared.requiresLocalTool,
+      allowToolCall: (toolCall) => {
+        if (!prepared.tools.length) return "No client tool inventory was available for this request.";
+        const toolCalls = toOpenAiToolCalls({
+          toolCalls: [toolCall],
+          tools: prepared.tools,
+          responseId: "probe",
+          context: prepared.toolContext
+        });
+        return toolCalls.length > 0
+          || toolCallRetryHint({ toolCall, tools: prepared.tools, context: prepared.toolContext });
+      }
+    });
+    return completion.stream;
+  };
+  const stream = retryingSdkStream(makeStream);
 
   if (prepared.stream) {
-    return streamOpenAiEvents(kind, completion.stream, {
+    return streamOpenAiEvents(kind, stream, {
       id,
       created,
       model: prepared.model,
@@ -389,7 +480,7 @@ async function handleSdkRoute(
     });
   }
 
-  const output = await collectCursorSdkOutput(completion.stream);
+  const output = await collectCursorSdkOutput(stream);
   const toolCalls = toOpenAiToolCalls({
     toolCalls: output.toolCalls,
     tools: prepared.tools,
