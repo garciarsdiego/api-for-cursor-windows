@@ -53,7 +53,15 @@ import {
 import { collectCursorOutput, type CursorTextEvent } from "../../worker/cursor";
 import { createCursorSdkCompletion, collectCursorSdkOutput } from "../../worker/cursor-sdk";
 import { encodeSse } from "../../worker/sse";
-import type { Deps, Env } from "../../worker/types";
+import type { CursorToolCall, Deps, Env } from "../../worker/types";
+import {
+  anthropicError,
+  anthropicMessage,
+  anthropicSseEvents,
+  anthropicToChatBody,
+  estimateTokens,
+  mapModel
+} from "./anthropic";
 
 const HOST = "127.0.0.1";
 const DEFAULT_PORT = 8787;
@@ -159,10 +167,15 @@ function storeResponse(id: string, response: Record<string, unknown>): void {
  * fall back to `CURSOR_API_KEY` from the environment.
  */
 function resolveApiKey(request: Request): string {
+  // Anthropic clients (Claude Code) send the key as `x-api-key`; OpenAI clients use
+  // `Authorization: Bearer`. Either source, with `cursor-local`/empty falling back to the
+  // env key (Credential Manager).
+  const apiKeyHeader = (request.headers.get("x-api-key") || "").trim();
   const authorization = request.headers.get("authorization") || "";
   const match = /^Bearer\s+(.+)$/i.exec(authorization.trim());
   const bearer = match ? match[1].trim() : "";
-  if (bearer && bearer !== LOCAL_API_KEY_LITERAL) return bearer;
+  const candidate = apiKeyHeader || bearer;
+  if (candidate && candidate !== LOCAL_API_KEY_LITERAL) return candidate;
   return (process.env.CURSOR_API_KEY || "").trim();
 }
 
@@ -409,6 +422,99 @@ function chatIncrementalPrompt(
   }
 }
 
+/** Shared tool-call gate for the SDK paths (OpenAI + Anthropic): allow a tool call only
+ * if it maps to a known client tool, else return a retry hint string. */
+function sdkAllowToolCall(prepared: PreparedRequest, toolCall: CursorToolCall) {
+  if (!prepared.tools.length) return "No client tool inventory was available for this request.";
+  const toolCalls = toOpenAiToolCalls({
+    toolCalls: [toolCall],
+    tools: prepared.tools,
+    responseId: "probe",
+    context: prepared.toolContext
+  });
+  return toolCalls.length > 0
+    || toolCallRetryHint({ toolCall, tools: prepared.tools, context: prepared.toolContext });
+}
+
+// ---------------------------------------------------------------------------
+// Anthropic Messages API (Claude Code). Translates Anthropic <-> the OpenAI/Cursor SDK
+// path via `anthropic.ts`. See docs/superpowers/specs/2026-06-02-anthropic-endpoint-*.
+// ---------------------------------------------------------------------------
+
+/** Wrap an Anthropic SSE event generator into a streaming Response. On mid-stream failure
+ * (after `message_start`), emit an Anthropic `error` event rather than a broken stream. */
+function anthropicSseResponse(events: AsyncGenerator<{ event: string; data: Record<string, unknown> }>): Response {
+  const readable = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      try {
+        for await (const { event, data } of events) controller.enqueue(encodeSse(data, event));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        controller.enqueue(encodeSse(anthropicError(message, "api_error"), "error"));
+      } finally {
+        controller.close();
+      }
+    }
+  });
+  return sseResponse(readable);
+}
+
+async function handleAnthropicMessages(request: Request): Promise<Response> {
+  const apiKey = resolveApiKey(request);
+  if (!apiKey) return json(anthropicError("Missing or invalid x-api-key.", "authentication_error"), { status: 401 });
+
+  const body = await request.json();
+  const requestedModel =
+    body && typeof body === "object" && typeof (body as { model?: unknown }).model === "string"
+      ? (body as { model: string }).model
+      : "claude";
+  const cursorModel = resolveCursorModel(mapModel(requestedModel));
+  const prepared = prepareChatRequest(anthropicToChatBody(body), cursorModel);
+  const id = `msg_${crypto.randomUUID().replaceAll("-", "")}`;
+  const inputTokens = estimateTokens(prepared.promptChars);
+
+  // Claude Code resends the full conversation (incl. tool_result) every turn, so /v1/messages is
+  // stateless: a fresh SDK session + full prompt per request, plus the transparent auto-retry.
+  const makeStream = async (_attempt: number): Promise<AsyncIterable<CursorTextEvent>> => {
+    const completion = await createCursorSdkCompletion(env, deps, apiKey, {
+      prompt: prepared.prompt,
+      model: prepared.cursorModel,
+      sessionKey: `cc-${crypto.randomUUID()}`,
+      sessionOwnerKey: sdkSessionOwner(apiKey),
+      workingDirectory: prepared.toolContext?.workingDirectory,
+      clientTools: prepared.tools,
+      requiresLocalTool: prepared.requiresLocalTool,
+      allowToolCall: (toolCall) => sdkAllowToolCall(prepared, toolCall)
+    });
+    return completion.stream;
+  };
+  const stream = retryingSdkStream(makeStream);
+
+  if (prepared.stream) {
+    return anthropicSseResponse(anthropicSseEvents({ id, model: requestedModel, inputTokens, stream }));
+  }
+
+  const output = await collectCursorSdkOutput(stream);
+  return json(
+    anthropicMessage({
+      id,
+      model: requestedModel,
+      text: output.text,
+      toolCalls: output.toolCalls,
+      inputTokens,
+      outputTokens: estimateTokens(output.text.length)
+    })
+  );
+}
+
+/** `POST /v1/messages/count_tokens` — Claude Code's pre-send estimate. Same body shape as
+ * `/v1/messages`. Auth is not required (it's only an estimate). */
+async function handleCountTokens(request: Request): Promise<Response> {
+  const body = await request.json();
+  const prepared = prepareChatRequest(anthropicToChatBody(body), resolveCursorModel(mapModel("")));
+  return json({ input_tokens: estimateTokens(prepared.promptChars) });
+}
+
 async function handleSdkRoute(
   kind: "chat" | "responses",
   request: Request,
@@ -435,17 +541,7 @@ async function handleSdkRoute(
       workingDirectory: prepared.toolContext?.workingDirectory,
       clientTools: prepared.tools,
       requiresLocalTool: prepared.requiresLocalTool,
-      allowToolCall: (toolCall) => {
-        if (!prepared.tools.length) return "No client tool inventory was available for this request.";
-        const toolCalls = toOpenAiToolCalls({
-          toolCalls: [toolCall],
-          tools: prepared.tools,
-          responseId: "probe",
-          context: prepared.toolContext
-        });
-        return toolCalls.length > 0
-          || toolCallRetryHint({ toolCall, tools: prepared.tools, context: prepared.toolContext });
-      }
+      allowToolCall: (toolCall) => sdkAllowToolCall(prepared, toolCall)
     });
     return completion.stream;
   };
@@ -709,6 +805,16 @@ async function route(request: Request, port: number): Promise<Response> {
     if (v1Path === "/responses") {
       if (request.method !== "POST") return notFound();
       return await handleResponses(request);
+    }
+
+    if (v1Path === "/messages/count_tokens") {
+      if (request.method !== "POST") return notFound();
+      return await handleCountTokens(request);
+    }
+
+    if (v1Path === "/messages") {
+      if (request.method !== "POST") return notFound();
+      return await handleAnthropicMessages(request);
     }
 
     const responseMatch = /^\/responses\/([^/]+)$/.exec(v1Path);
