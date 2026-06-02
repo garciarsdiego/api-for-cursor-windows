@@ -270,6 +270,10 @@ The updater **public** key lives in `tauri.conf.json` (`plugins.updater.pubkey`)
 
 ---
 
-Built with [Tauri 2](https://v2.tauri.app/). Backed by [`@cursor/sdk`](https://www.npmjs.com/package/@cursor/sdk)
-and the Cursor Composer models. See [`BUILD_CONTRACT.md`](./BUILD_CONTRACT.md) for the
-detailed port decisions and the macOS→Windows mapping.
+This is the Windows port of the macOS **API for Cursor** by Standard Agents —
+[standardagents/composer-api](https://github.com/standardagents/composer-api) (MIT), which
+provides the macOS app, the Cloudflare Worker / OpenAI-compatibility layer, and the
+`@cursor/sdk` bridge this app bundles. Built with [Tauri 2](https://v2.tauri.app/) and backed by
+[`@cursor/sdk`](https://www.npmjs.com/package/@cursor/sdk) + the Cursor Composer models. See
+[`BUILD_CONTRACT.md`](./BUILD_CONTRACT.md) for the detailed port decisions and the macOS→Windows
+mapping, and the repo [`CHANGELOG.md`](../CHANGELOG.md) for version history.
