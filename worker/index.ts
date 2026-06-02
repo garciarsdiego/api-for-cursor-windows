@@ -111,11 +111,12 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
 }
 
 const LATEST_DMG_NAME = "API-for-Cursor-latest.dmg";
+const LATEST_WINDOWS_SETUP_NAME = "API-for-Cursor-latest-x64-setup.exe";
 const RELEASE_OBJECT_PREFIX = "releases/";
 const NOTARY_WEBHOOK_PREFIX = "/api/notary/webhook/";
 
 function isReleaseRoute(pathname: string): boolean {
-  return pathname === "/download" || pathname === "/appcast.xml" || pathname.startsWith("/releases/");
+  return pathname === "/download" || pathname === "/download/windows" || pathname === "/appcast.xml" || pathname.startsWith("/releases/");
 }
 
 function isNotaryWebhookRoute(pathname: string): boolean {
@@ -229,6 +230,10 @@ async function handleReleaseRoute(request: Request, env: Env, url: URL): Promise
     return Response.redirect(new URL(`/releases/${LATEST_DMG_NAME}`, url).toString(), 302);
   }
 
+  if (url.pathname === "/download/windows") {
+    return Response.redirect(new URL(`/releases/windows/${LATEST_WINDOWS_SETUP_NAME}`, url).toString(), 302);
+  }
+
   if (!env.RELEASES) {
     return notFound();
   }
@@ -272,6 +277,8 @@ function cacheControlForReleaseKey(key: string): string {
 function contentTypeForReleaseKey(key: string): string {
   if (key === "appcast.xml") return "application/rss+xml; charset=utf-8";
   if (key.endsWith(".dmg")) return "application/x-apple-diskimage";
+  if (key.endsWith(".exe")) return "application/octet-stream";
+  if (key.endsWith(".json")) return "application/json; charset=utf-8";
   return "application/octet-stream";
 }
 
