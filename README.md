@@ -117,21 +117,33 @@ instructions: [`windows-app/README.md`](windows-app/README.md#build-from-source)
 
 ## Roadmap
 
-- **More harnesses** — ✅ **Claude Code** via the Anthropic `/v1/messages` endpoint (shipped in
-  0.2.0). Next: improve the Claude Code tool-loop fidelity, and first-class setup for more agents
-  (Aider, Continue, Roo Code, Zed).
+Done so far: ✅ OpenAI-compatible local API + one-click agent setup (0.1.0) · ✅ multi-turn chat
+fix (0.1.1) · ✅ transparent auto-retry for transient bridge stalls + session reuse (0.1.2) ·
+✅ **Claude Code** via the Anthropic `/v1/messages` endpoint (0.2.0).
+
+Next:
+
+- **Claude Code performance** — Claude Code sends a large system prompt + ~30k tokens of tool
+  definitions every turn, and each request currently spins up a fresh `@cursor/sdk` agent. Two
+  tracks to make it fast:
+  - **Cut the per-turn payload** — prune/compact the tool & skill definitions before they reach
+    Composer (drop rarely-used tools, shrink JSON-Schemas, strip examples) so less is re-sent
+    each turn.
+  - **Reuse the SDK agent across turns** — keep one agent per Claude Code session (keyed on a
+    stable session id) and send only the new turn (`incrementalPrompt`) instead of the whole
+    conversation, the way the macOS app does. Removes the per-request cold start.
+- **More harnesses** — first-class setup for more agents (Aider, Continue, Roo Code, Zed).
 - **Linux build** — Tauri targets Linux; ship an AppImage/`.deb` reusing the same Node SDK-bridge
   runtime.
-- **Reliability** — transparent auto-retry for transient bridge stalls (so the occasional
-  `Cursor SDK bridge run timed out` self-recovers without a manual retry), plus a bridge
-  readiness wait to remove the first-request cold-start failure.
 - **Polish** — EV code-signing to remove the SmartScreen warning; auto-restart the server when
-  the API key is saved (so no manual Stop → Start).
+  the API key is saved (so no manual Stop → Start); a bridge readiness wait to remove the
+  first-request cold-start failure.
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). Highlights: **0.1.1** fixed multi-turn chat timing out with
-session-reusing clients (e.g. OpenCode).
+See [CHANGELOG.md](CHANGELOG.md). Highlights: **0.2.0** added Claude Code support via the Anthropic
+`/v1/messages` endpoint; **0.1.2** added transparent auto-retry + SDK session reuse; **0.1.1** fixed
+multi-turn chat timing out with session-reusing clients (e.g. OpenCode).
 
 ## Credits
 
