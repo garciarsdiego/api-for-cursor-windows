@@ -2,6 +2,18 @@
 
 All notable changes to the Windows app. Versions are the app/installer version.
 
+## 0.2.0 — 2026-06-02
+
+### Added
+- **Claude Code support** via an Anthropic Messages-compatible endpoint. The local server now
+  also serves `POST /v1/messages` (non-stream `Message` + Anthropic SSE) and
+  `POST /v1/messages/count_tokens`. Point Claude Code at it with
+  `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` and `ANTHROPIC_API_KEY=cursor-local`. Text chat and
+  tool use are translated to/from the existing Cursor SDK path; key is read from `x-api-key`.
+  - **Caveat:** Composer wasn't trained on Claude Code's exact tool schemas, so the agentic
+    tool loop can be less reliable than native Claude (improving tool-loop fidelity is on the
+    roadmap). One tool call per turn (sequential).
+
 ## 0.1.2 — 2026-06-02
 
 ### Improved

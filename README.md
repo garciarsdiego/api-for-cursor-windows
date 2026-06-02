@@ -50,10 +50,22 @@ Invoke-RestMethod http://127.0.0.1:8787/health
 | API key | your Cursor key (`crsr_…`), or `cursor-local` if you saved it in the app |
 | Model | `composer-2.5` or `composer-2.5-fast` |
 
-Endpoints: `GET /v1/models`, `POST /v1/chat/completions` (stream + non-stream), `POST /v1/responses`, `GET /health`.
+Endpoints: `GET /v1/models`, `POST /v1/chat/completions` (stream + non-stream), `POST /v1/responses`, `POST /v1/messages` (Anthropic, for Claude Code), `GET /health`.
 
-> **Claude Code is not supported** — it speaks Anthropic's Messages API, while this is an
-> OpenAI-compatible API. (An Anthropic-compatible endpoint is on the [Roadmap](#roadmap).)
+### Use it in Claude Code
+
+Claude Code (the CLI) talks to the Anthropic Messages API — point it at the local
+Anthropic-compatible `/v1/messages` endpoint:
+
+```powershell
+$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8787"
+$env:ANTHROPIC_API_KEY  = "cursor-local"   # or your crsr_... key
+claude
+```
+
+Text chat and tool use both work (Claude Code reads/edits files via Composer). **Caveat:**
+Composer wasn't trained on Claude Code's exact tool schemas, so the agentic tool loop can be less
+reliable than native Claude — see the [Roadmap](#roadmap) / [Changelog](CHANGELOG.md).
 
 ## Configure agents (one-click)
 
@@ -105,9 +117,9 @@ instructions: [`windows-app/README.md`](windows-app/README.md#build-from-source)
 
 ## Roadmap
 
-- **Native compatibility with more harnesses** — first-class setup for more agents (Aider,
-  Continue, Roo Code, Zed) and an **Anthropic-compatible endpoint** so **Claude Code** can use
-  Composer (today the API is OpenAI-only).
+- **More harnesses** — ✅ **Claude Code** via the Anthropic `/v1/messages` endpoint (shipped in
+  0.2.0). Next: improve the Claude Code tool-loop fidelity, and first-class setup for more agents
+  (Aider, Continue, Roo Code, Zed).
 - **Linux build** — Tauri targets Linux; ship an AppImage/`.deb` reusing the same Node SDK-bridge
   runtime.
 - **Reliability** — transparent auto-retry for transient bridge stalls (so the occasional
