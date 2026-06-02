@@ -1,0 +1,723 @@
+/**
+ * API for Cursor — standalone sidecar server.
+ *
+ * A `node:http` server that exposes the standard (non-account) OpenAI-compatible
+ * `/v1/*` surface by reusing the import-clean worker helpers.
+ *
+ * It has two paths for chat/responses:
+ *   - PRIMARY (full macOS parity): when `CURSOR_SDK_BRIDGE_URL` is set, route via
+ *     `worker/cursor-sdk.ts` `createCursorSdkCompletion`, mirroring `worker/index.ts`.
+ *     This works with only the user's Cursor key (no private backend secrets).
+ *   - FALLBACK: the direct `worker/cursor.ts` path when no bridge is configured.
+ *
+ * `cursor-sdk.ts` is import-clean here: it only TYPE-references
+ * `DurableObjectNamespace` and touches `env.DB` inside try/catch (in-memory
+ * fallback), so an undefined `env.DB` is fine. We still avoid importing
+ * `worker/index`, `worker/db`, or `worker/sdk-bridge-container`.
+ *
+ * The worker helpers operate on Web `Request`/`Response` and parsed JSON. Node
+ * 24 ships global `fetch`/`Request`/`Response`/`ReadableStream`/`crypto`, so we
+ * only need thin adapters between `node:http` messages and Web types.
+ */
+
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+
+import {
+  createCursorCompletion,
+  resolveCursorModel,
+  streamCursorText,
+  type CursorTextEvent
+} from "../../worker/cursor";
+import { errorResponse, json, notFound, openAiError, sseResponse, unauthorized } from "../../worker/http";
+import {
+  chatChunk,
+  chatCompletionResponse,
+  chatUsageChunk,
+  completionCharsFromOutput,
+  doneChunk,
+  modelList,
+  prepareChatRequest,
+  prepareResponsesRequest,
+  responseCreatedEvents,
+  responseDeltaEvent,
+  responseDoneEvents,
+  responseObject,
+  responseTextStartEvents,
+  responseToolCallEvents,
+  toOpenAiToolCalls,
+  toolCallRetryHint,
+  type OpenAiToolCall,
+  type OpenAiToolSpec,
+  type ToolCallContext
+} from "../../worker/openai";
+import { collectCursorOutput } from "../../worker/cursor";
+import { createCursorSdkCompletion, collectCursorSdkOutput } from "../../worker/cursor-sdk";
+import { encodeSse } from "../../worker/sse";
+import type { Deps, Env } from "../../worker/types";
+
+const HOST = "127.0.0.1";
+const DEFAULT_PORT = 8787;
+const LOCAL_API_KEY_LITERAL = "cursor-local";
+const PRIMARY_MODEL = "composer-2.5";
+const FAST_MODEL = "composer-2.5-fast";
+
+/**
+ * Minimal `Deps` backed by the real runtime. Identical in spirit to the
+ * worker's `defaultDeps`, but with no Cloudflare assumptions.
+ */
+const deps: Deps = {
+  fetch: (input, init) => fetch(input, init),
+  now: () => new Date(),
+  randomUUID: () => crypto.randomUUID()
+};
+
+/**
+ * Build the minimal `Env` that `cursor.ts` needs. Only the Cursor-facing fields
+ * are populated; D1/R2/Container fields are typed away with `undefined`/casts
+ * because the standard `/v1` glue never touches them.
+ *
+ * The Cursor backend base URL and chat endpoint are deployment secrets (they
+ * live in worker secrets, not as constants in `cursor.ts`), so we forward them
+ * from the process environment when present. `/v1/models` and `/health` never
+ * read them; chat/responses will surface a clean `HttpError` if a live request
+ * is attempted without them configured.
+ */
+function buildEnv(): Env {
+  return {
+    ASSETS: undefined as unknown as Env["ASSETS"],
+    DB: undefined as unknown as Env["DB"],
+    ENCRYPTION_KEY: process.env.ENCRYPTION_KEY || "api-for-cursor",
+    CURSOR_API_BASE: process.env.CURSOR_API_BASE || "https://api.cursor.com",
+    CURSOR_BACKEND_BASE_URL: process.env.CURSOR_BACKEND_BASE_URL,
+    CURSOR_CHAT_ENDPOINT: process.env.CURSOR_CHAT_ENDPOINT,
+    CURSOR_CLIENT_VERSION: process.env.CURSOR_CLIENT_VERSION || "2.6.22",
+    CURSOR_SDK_BRIDGE_URL: process.env.CURSOR_SDK_BRIDGE_URL,
+    CURSOR_SDK_BRIDGE_TOKEN: process.env.CURSOR_SDK_BRIDGE_TOKEN,
+    CURSOR_SDK_BRIDGE_TIMEOUT_MS: process.env.CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS
+  };
+}
+
+const env = buildEnv();
+
+/**
+ * The SDK bridge path (full macOS parity) is the PRIMARY route for
+ * chat/responses whenever `CURSOR_SDK_BRIDGE_URL` is set. Otherwise we fall back
+ * to the direct `worker/cursor.ts` path.
+ */
+function hasSdkBridge(): boolean {
+  return Boolean(env.CURSOR_SDK_BRIDGE_URL?.trim());
+}
+
+/**
+ * Derive a stable session key so multi-turn conversations reuse the same SDK
+ * agent. Mirrors the worker's session-affinity headers, falling back to a fresh
+ * UUID when the client provides none.
+ */
+function sessionAffinity(request: Request): string {
+  const headers = request.headers;
+  const candidate =
+    headers.get("x-session-affinity") ||
+    headers.get("x-opencode-session-id") ||
+    headers.get("x-opencode-session") ||
+    headers.get("idempotency-key") ||
+    "";
+  const trimmed = candidate.trim();
+  return trimmed || `session-${crypto.randomUUID()}`;
+}
+
+/**
+ * Owner key for SDK session scoping. We key the session cache to the resolved
+ * Cursor API key so distinct keys never share an agent.
+ */
+function sdkSessionOwner(apiKey: string): string {
+  return `cursor-key:${apiKey}`;
+}
+
+/**
+ * Best-effort, in-memory store for the Responses API so that
+ * `GET/DELETE /v1/responses/{id}` can echo a previously created response.
+ */
+interface StoredResponse {
+  response: Record<string, unknown>;
+  updatedAt: number;
+}
+const responseStore = new Map<string, StoredResponse>();
+const RESPONSE_STORE_LIMIT = 512;
+
+function storeResponse(id: string, response: Record<string, unknown>): void {
+  responseStore.set(id, { response, updatedAt: Date.now() });
+  if (responseStore.size <= RESPONSE_STORE_LIMIT) return;
+  const entries = [...responseStore.entries()].sort((a, b) => a[1].updatedAt - b[1].updatedAt);
+  for (const [key] of entries.slice(0, responseStore.size - RESPONSE_STORE_LIMIT)) {
+    responseStore.delete(key);
+  }
+}
+
+/**
+ * Resolve the Cursor API key for a request. The incoming bearer wins unless it
+ * is absent or the local placeholder literal (`cursor-local`), in which case we
+ * fall back to `CURSOR_API_KEY` from the environment.
+ */
+function resolveApiKey(request: Request): string {
+  const authorization = request.headers.get("authorization") || "";
+  const match = /^Bearer\s+(.+)$/i.exec(authorization.trim());
+  const bearer = match ? match[1].trim() : "";
+  if (bearer && bearer !== LOCAL_API_KEY_LITERAL) return bearer;
+  return (process.env.CURSOR_API_KEY || "").trim();
+}
+
+// ---------------------------------------------------------------------------
+// Route handlers (Web Request -> Web Response). These replicate ONLY the
+// standard `/v1` glue from `worker/index.ts`, dropping the proxy/account/SDK
+// paths and the Cloudflare `ExecutionContext`.
+// ---------------------------------------------------------------------------
+
+function healthResponse(port: number): Response {
+  return json({
+    ok: true,
+    service: "api-for-cursor",
+    host: HOST,
+    models: [PRIMARY_MODEL, FAST_MODEL],
+    baseUrl: `http://${HOST}:${port}/v1`
+  });
+}
+
+function handleModels(): Response {
+  return json(modelList());
+}
+
+function handleModel(id: string): Response {
+  const list = modelList().data as Array<Record<string, unknown>>;
+  const model = list.find((item) => item.id === id);
+  if (!model) return openAiError(`Model '${id}' not found`, 404, "not_found", "model");
+  return json(model);
+}
+
+async function handleChatCompletions(request: Request): Promise<Response> {
+  const apiKey = resolveApiKey(request);
+  if (!apiKey) return unauthorized();
+
+  const body = await request.json();
+  const requestedModel = typeof (body as { model?: unknown })?.model === "string" ? (body as { model: string }).model : PRIMARY_MODEL;
+  const cursorModel = resolveCursorModel(requestedModel);
+  const prepared = prepareChatRequest(body, cursorModel);
+
+  const id = `chatcmpl_${crypto.randomUUID().replaceAll("-", "")}`;
+  const created = Math.floor(deps.now().getTime() / 1000);
+
+  if (hasSdkBridge()) {
+    return handleSdkRoute("chat", request, prepared, apiKey, id, created);
+  }
+
+  const completion = await createCursorCompletion(env, deps, apiKey, {
+    prompt: prepared.prompt,
+    model: prepared.cursorModel
+  });
+
+  if (prepared.stream) {
+    return streamOpenAiResponse("chat", completion.stream, {
+      id,
+      created,
+      model: prepared.model,
+      promptChars: prepared.promptChars,
+      includeUsage: prepared.includeUsage,
+      tools: prepared.tools,
+      context: prepared.toolContext
+    });
+  }
+
+  const output = await collectCursorOutput(completion.stream);
+  const toolCalls = toOpenAiToolCalls({
+    toolCalls: output.toolCalls,
+    tools: prepared.tools,
+    responseId: id,
+    context: prepared.toolContext
+  });
+  return json(
+    chatCompletionResponse({
+      id,
+      created,
+      model: prepared.model,
+      text: output.text,
+      toolCalls,
+      promptChars: prepared.promptChars,
+      metadata: prepared.responseMetadata
+    })
+  );
+}
+
+async function handleResponses(request: Request): Promise<Response> {
+  const apiKey = resolveApiKey(request);
+  if (!apiKey) return unauthorized();
+
+  const body = await request.json();
+  const requestedModel = typeof (body as { model?: unknown })?.model === "string" ? (body as { model: string }).model : PRIMARY_MODEL;
+  const cursorModel = resolveCursorModel(requestedModel);
+  const prepared = prepareResponsesRequest(body, cursorModel);
+
+  const id = `resp_${crypto.randomUUID().replaceAll("-", "")}`;
+  const created = Math.floor(deps.now().getTime() / 1000);
+
+  if (hasSdkBridge()) {
+    return handleSdkRoute("responses", request, prepared, apiKey, id, created);
+  }
+
+  const completion = await createCursorCompletion(env, deps, apiKey, {
+    prompt: prepared.prompt,
+    model: prepared.cursorModel
+  });
+
+  if (prepared.stream) {
+    return streamOpenAiResponse("responses", completion.stream, {
+      id,
+      created,
+      model: prepared.model,
+      promptChars: prepared.promptChars,
+      includeUsage: prepared.includeUsage,
+      metadata: prepared.responseMetadata,
+      tools: prepared.tools,
+      context: prepared.toolContext,
+      onDone: (text, _completionChars, toolCalls) => {
+        storeResponse(
+          id,
+          responseObject({
+            id,
+            created,
+            model: prepared.model,
+            text,
+            toolCalls,
+            promptChars: prepared.promptChars,
+            metadata: prepared.responseMetadata
+          })
+        );
+      }
+    });
+  }
+
+  const output = await collectCursorOutput(completion.stream);
+  const toolCalls = toOpenAiToolCalls({
+    toolCalls: output.toolCalls,
+    tools: prepared.tools,
+    responseId: id,
+    context: prepared.toolContext
+  });
+  const response = responseObject({
+    id,
+    created,
+    model: prepared.model,
+    text: output.text,
+    toolCalls,
+    promptChars: prepared.promptChars,
+    metadata: prepared.responseMetadata
+  });
+  storeResponse(id, response);
+  return json(response);
+}
+
+// ---------------------------------------------------------------------------
+// SDK bridge path (full macOS parity). Mirrors `worker/index.ts`
+// `handleSdkPreparedOpenAiRoute`: `createCursorSdkCompletion` ->
+// `collectCursorSdkOutput` + `chatCompletionResponse`/`responseObject` (non-stream)
+// or `streamOpenAiEvents` over `completion.stream` (stream). The SDK completion's
+// `.stream` is already an `AsyncIterable<CursorTextEvent>`, so the same
+// `streamOpenAiEvents` / collected-output builders work unchanged.
+// ---------------------------------------------------------------------------
+
+type PreparedRequest = ReturnType<typeof prepareChatRequest> | ReturnType<typeof prepareResponsesRequest>;
+
+async function handleSdkRoute(
+  kind: "chat" | "responses",
+  request: Request,
+  prepared: PreparedRequest,
+  apiKey: string,
+  id: string,
+  created: number
+): Promise<Response> {
+  const completion = await createCursorSdkCompletion(env, deps, apiKey, {
+    prompt: prepared.prompt,
+    model: prepared.cursorModel,
+    sessionKey: sessionAffinity(request),
+    sessionOwnerKey: sdkSessionOwner(apiKey),
+    workingDirectory: prepared.toolContext?.workingDirectory,
+    clientTools: prepared.tools,
+    requiresLocalTool: prepared.requiresLocalTool,
+    allowToolCall: (toolCall) => {
+      if (!prepared.tools.length) return "No client tool inventory was available for this request.";
+      const toolCalls = toOpenAiToolCalls({
+        toolCalls: [toolCall],
+        tools: prepared.tools,
+        responseId: "probe",
+        context: prepared.toolContext
+      });
+      return toolCalls.length > 0
+        || toolCallRetryHint({ toolCall, tools: prepared.tools, context: prepared.toolContext });
+    }
+  });
+
+  if (prepared.stream) {
+    return streamOpenAiEvents(kind, completion.stream, {
+      id,
+      created,
+      model: prepared.model,
+      promptChars: prepared.promptChars,
+      includeUsage: prepared.includeUsage,
+      metadata: prepared.responseMetadata,
+      tools: prepared.tools,
+      context: prepared.toolContext,
+      onDone: (text, _completionChars, toolCalls) => {
+        if (kind === "responses") {
+          storeResponse(
+            id,
+            responseObject({
+              id,
+              created,
+              model: prepared.model,
+              text,
+              toolCalls,
+              promptChars: prepared.promptChars,
+              metadata: prepared.responseMetadata
+            })
+          );
+        }
+      }
+    });
+  }
+
+  const output = await collectCursorSdkOutput(completion.stream);
+  const toolCalls = toOpenAiToolCalls({
+    toolCalls: output.toolCalls,
+    tools: prepared.tools,
+    responseId: id,
+    context: prepared.toolContext
+  });
+
+  if (kind === "chat") {
+    return json(
+      chatCompletionResponse({
+        id,
+        created,
+        model: prepared.model,
+        text: output.text,
+        toolCalls,
+        promptChars: prepared.promptChars,
+        metadata: prepared.responseMetadata
+      })
+    );
+  }
+
+  const response = responseObject({
+    id,
+    created,
+    model: prepared.model,
+    text: output.text,
+    toolCalls,
+    promptChars: prepared.promptChars,
+    metadata: prepared.responseMetadata
+  });
+  storeResponse(id, response);
+  return json(response);
+}
+
+function handleResponseState(request: Request, responseId: string): Response {
+  const stored = responseStore.get(responseId);
+  if (!stored) return openAiError("Response not found", 404, "not_found");
+  if (request.method === "GET" || request.method === "HEAD") {
+    return json(stored.response);
+  }
+  if (request.method === "DELETE") {
+    responseStore.delete(responseId);
+    return json({ id: responseId, object: "response", deleted: true });
+  }
+  return notFound();
+}
+
+// ---------------------------------------------------------------------------
+// Streaming glue. This mirrors `streamOpenAiEvents` from `worker/index.ts` but
+// runs the pump directly (no `ExecutionContext.waitUntil`) and skips the
+// request-log bookkeeping that only exists on the hosted proxy path.
+// ---------------------------------------------------------------------------
+
+interface StreamInput {
+  id: string;
+  created: number;
+  model: string;
+  promptChars: number;
+  includeUsage: boolean;
+  metadata?: Record<string, unknown>;
+  tools: OpenAiToolSpec[];
+  context?: ToolCallContext;
+  onDone?: (text: string, completionChars: number, toolCalls: OpenAiToolCall[]) => void;
+}
+
+function streamOpenAiResponse(kind: "chat" | "responses", cursorStream: Response, input: StreamInput): Response {
+  return streamOpenAiEvents(kind, streamCursorText(cursorStream), input);
+}
+
+function streamOpenAiEvents(
+  kind: "chat" | "responses",
+  cursorEvents: AsyncIterable<CursorTextEvent>,
+  input: StreamInput
+): Response {
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+  const writer = writable.getWriter();
+  const pump = async () => {
+    let text = "";
+    let toolCallCount = 0;
+    let finishReason: "stop" | "tool_calls" = "stop";
+    const streamedToolCalls: OpenAiToolCall[] = [];
+    let responseNextOutputIndex = 0;
+    let responseTextOutputIndex: number | null = null;
+    try {
+      if (kind === "chat") {
+        await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, role: "assistant" }));
+      } else {
+        for (const event of responseCreatedEvents(input)) await writer.write(event);
+      }
+
+      for await (const event of cursorEvents) {
+        if (event.type === "text" && event.text) {
+          text += event.text;
+          if (kind === "chat") {
+            await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, delta: event.text }));
+          } else {
+            if (responseTextOutputIndex === null) {
+              responseTextOutputIndex = responseNextOutputIndex;
+              responseNextOutputIndex += 1;
+              for (const chunk of responseTextStartEvents({ id: input.id, outputIndex: responseTextOutputIndex })) {
+                await writer.write(chunk);
+              }
+            }
+            await writer.write(responseDeltaEvent({ id: input.id, delta: event.text, outputIndex: responseTextOutputIndex }));
+          }
+        }
+        if (event.type === "tool_call") {
+          const [toolCall] = toOpenAiToolCalls({
+            toolCalls: [event.toolCall],
+            tools: input.tools,
+            responseId: input.id,
+            startIndex: toolCallCount,
+            context: input.context
+          });
+          if (!toolCall) continue;
+          finishReason = "tool_calls";
+          streamedToolCalls.push(toolCall);
+          if (kind === "chat") {
+            await writer.write(
+              chatChunk({ id: input.id, created: input.created, model: input.model, toolCall: { index: toolCallCount, value: toolCall } })
+            );
+          } else {
+            for (const chunk of responseToolCallEvents({ id: input.id, toolCall, outputIndex: responseNextOutputIndex })) {
+              await writer.write(chunk);
+            }
+            responseNextOutputIndex += 1;
+          }
+          toolCallCount += 1;
+        }
+        if (event.type === "done") {
+          text = event.finalText;
+        }
+      }
+
+      if (kind === "chat") {
+        const completionChars = completionCharsFromOutput(text, streamedToolCalls);
+        await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, finish: true, finishReason }));
+        if (input.includeUsage) {
+          await writer.write(
+            chatUsageChunk({
+              id: input.id,
+              created: input.created,
+              model: input.model,
+              promptChars: input.promptChars,
+              completionChars
+            })
+          );
+        }
+        await writer.write(doneChunk());
+      } else {
+        if (responseTextOutputIndex === null && !streamedToolCalls.length) {
+          responseTextOutputIndex = responseNextOutputIndex;
+          responseNextOutputIndex += 1;
+          for (const chunk of responseTextStartEvents({ id: input.id, outputIndex: responseTextOutputIndex })) {
+            await writer.write(chunk);
+          }
+        }
+        for (const event of responseDoneEvents({
+          ...input,
+          text,
+          toolCalls: streamedToolCalls,
+          textStarted: responseTextOutputIndex !== null,
+          textOutputIndex: responseTextOutputIndex ?? 0
+        })) {
+          await writer.write(event);
+        }
+      }
+      input.onDone?.(text, completionCharsFromOutput(text, streamedToolCalls), streamedToolCalls);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Stream failed";
+      await writer
+        .write(encodeSse({ error: { message, type: "cursor_error", code: "cursor_stream_error" } }, "error"))
+        .catch(() => undefined);
+    } finally {
+      await writer.close().catch(() => undefined);
+    }
+  };
+  void pump();
+  return sseResponse(readable);
+}
+
+// ---------------------------------------------------------------------------
+// Router. Only the bare `/v1/...` surface is matched; account-scoped,
+// opencode, and opencodev2 surfaces from the worker are intentionally omitted.
+// ---------------------------------------------------------------------------
+
+async function route(request: Request, port: number): Promise<Response> {
+  if (request.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        "access-control-allow-origin": "*",
+        "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
+        "access-control-allow-headers": "authorization,content-type,x-api-key"
+      }
+    });
+  }
+
+  const url = new URL(request.url);
+  const pathname = url.pathname.replace(/\/+$/, "") || "/";
+
+  try {
+    if (pathname === "/health") {
+      if (request.method !== "GET" && request.method !== "HEAD") return notFound();
+      return healthResponse(port);
+    }
+
+    const v1Path = pathname.startsWith("/v1/") ? pathname.slice(3) : pathname === "/v1" ? "/" : "";
+
+    if (v1Path === "/models") {
+      if (request.method !== "GET") return notFound();
+      return handleModels();
+    }
+
+    const modelMatch = /^\/models\/(.+)$/.exec(v1Path);
+    if (modelMatch) {
+      if (request.method !== "GET") return notFound();
+      return handleModel(decodeURIComponent(modelMatch[1]));
+    }
+
+    if (v1Path === "/chat/completions") {
+      if (request.method !== "POST") return notFound();
+      return await handleChatCompletions(request);
+    }
+
+    if (v1Path === "/responses") {
+      if (request.method !== "POST") return notFound();
+      return await handleResponses(request);
+    }
+
+    const responseMatch = /^\/responses\/([^/]+)$/.exec(v1Path);
+    if (responseMatch) {
+      return handleResponseState(request, decodeURIComponent(responseMatch[1]));
+    }
+
+    return notFound();
+  } catch (error) {
+    return errorResponse(error);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// node:http <-> Web Request/Response adapters.
+// ---------------------------------------------------------------------------
+
+function toWebRequest(req: IncomingMessage, port: number): Request {
+  const method = req.method || "GET";
+  const url = `http://${HOST}:${port}${req.url || "/"}`;
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (value === undefined) continue;
+    if (Array.isArray(value)) {
+      for (const item of value) headers.append(key, item);
+    } else {
+      headers.set(key, value);
+    }
+  }
+
+  const init: RequestInit = { method, headers };
+  if (method !== "GET" && method !== "HEAD") {
+    const chunks: Buffer[] = [];
+    const bodyPromise = new Promise<Buffer>((resolve, reject) => {
+      req.on("data", (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
+      req.on("end", () => resolve(Buffer.concat(chunks)));
+      req.on("error", reject);
+    });
+    // Materialize the body synchronously-ish: callers await `route`, which
+    // awaits `request.json()`. We attach a stream so the Web Request can read it.
+    init.body = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const buffer = await bodyPromise;
+        if (buffer.length) controller.enqueue(new Uint8Array(buffer));
+        controller.close();
+      }
+    });
+    (init as { duplex?: string }).duplex = "half";
+  }
+  return new Request(url, init);
+}
+
+async function writeWebResponse(res: ServerResponse, response: Response): Promise<void> {
+  const headers: Record<string, string> = {};
+  response.headers.forEach((value, key) => {
+    headers[key] = value;
+  });
+  res.writeHead(response.status, headers);
+
+  if (!response.body) {
+    res.end();
+    return;
+  }
+
+  const reader = response.body.getReader();
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) res.write(Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock();
+    res.end();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Boot.
+// ---------------------------------------------------------------------------
+
+function parsePort(): number {
+  const raw = process.env.PORT;
+  if (!raw) return DEFAULT_PORT;
+  const value = Number.parseInt(raw, 10);
+  return Number.isInteger(value) && value > 0 && value < 65536 ? value : DEFAULT_PORT;
+}
+
+function main(): void {
+  const port = parsePort();
+  const server = createServer((req, res) => {
+    const request = toWebRequest(req, port);
+    route(request, port)
+      .then((response) => writeWebResponse(res, response))
+      .catch((error) => {
+        const response = errorResponse(error);
+        writeWebResponse(res, response).catch(() => {
+          if (!res.headersSent) res.writeHead(500);
+          res.end();
+        });
+      });
+  });
+
+  server.listen(port, HOST, () => {
+    console.log(`API for Cursor server running at http://${HOST}:${port}/v1`);
+  });
+}
+
+main();
