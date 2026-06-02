@@ -48,28 +48,46 @@ The shared `worker/` layer is NOT modified (Anthropic support is a Windows-app c
 
 - `POST /v1/messages` — core. Non-stream → `Message` object; `stream:true` → Anthropic SSE.
 - `POST /v1/messages/count_tokens` → `{ "input_tokens": <estimate> }` (char-based, reusing the
-  existing usage estimator). Claude Code calls this before sending.
+  existing usage estimator). The request body is the **same shape as `/v1/messages`** (model,
+  messages, system, tools) — reuse the same request parser, then estimate over the assembled prompt.
 - Reuse existing `GET /health`. (No `/v1/models` change needed for Claude Code.)
 
-## Auth & model mapping
+## Auth & model mapping  (review: B1, S5, S8)
 
-- Accept the Cursor key from **`x-api-key`** header (Claude Code's `ANTHROPIC_API_KEY`) OR
-  `Authorization: Bearer`. The literal `cursor-local` (or empty) falls back to
-  `process.env.CURSOR_API_KEY` (Credential Manager), like the OpenAI path. Extend `resolveApiKey`.
-- Map any incoming `model` → `composer-2.5`; map names containing `haiku` → `composer-2.5-fast`.
-  Echo the **requested** model string back in the response `model` field (Claude Code is lenient).
+- **Key:** read **`x-api-key`** FIRST (Claude Code sends `ANTHROPIC_API_KEY` here, not Bearer),
+  then `Authorization: Bearer`, then `cursor-local`/empty → `process.env.CURSOR_API_KEY`
+  (Credential Manager). The `cursor-local` literal fallback applies to BOTH header sources.
+  Extend `resolveApiKey` accordingly — without this every request 401s.
+- **Headers:** ignore `anthropic-version` and `anthropic-beta` (Claude Code sends them); never 400
+  a request for including them; do not require them.
+- **Model:** map ANY incoming `model` → `composer-2.5`. Do NOT route `haiku` → `composer-2.5-fast`
+  — fast is `{input 3, output 15}` vs `{0.5, 2.5}` (6× cost), and Claude Code fires many cheap
+  `haiku` calls (titles etc.), so that mapping inverts the economics. Echo the **requested** model
+  string back in the response `model` field (Claude Code is lenient).
 
-## Request translation (Anthropic → internal)
+## Request translation (Anthropic → internal)  (review: B3, N1, N3, N5, S9)
 
 Build an OpenAI-shaped chat body, then call `prepareChatRequest`:
-- `system` (string or `[{type:"text",text}]`) → a leading OpenAI `system` message.
+- `system` (string OR `[{type:"text",text, ...}]`) → a leading OpenAI `system` message.
+  Concatenate `text` blocks; **ignore unknown keys** (e.g. `cache_control`) — don't crash.
 - `messages[]`, each `content` is a string or an array of blocks:
   - `text` → text content.
-  - `image` (`source.type:"base64"`) → OpenAI `image_url` data URL (reuse existing image limits).
-  - `tool_use` (assistant) → OpenAI assistant `tool_calls` (`id`, `function.name`, `arguments`).
-  - `tool_result` (user, `tool_use_id`, `content`) → OpenAI `tool` message (`tool_call_id`, content).
+  - `image` (`source.type:"base64"`, `{media_type,data}`) → OpenAI
+    `{type:"image_url", image_url:{url:"data:<media_type>;base64,<data>"}}` (reuse existing image
+    limits). Non-base64 sources (`url`, file ids): best-effort or skip with a text note — never crash.
+  - `tool_use` (assistant; `id`,`name`,`input`) → OpenAI assistant `tool_calls`
+    (`id` = the inbound `toolu_…` **verbatim**, `function.name`=name, `arguments`=JSON.stringify(input)).
+    Assistant turns with only tool_use → OpenAI assistant `content:null` + `tool_calls` (handled).
+  - `tool_result` (user; `tool_use_id`, `content`, `is_error?`) → OpenAI `tool` message
+    (`tool_call_id` = the same `toolu_…` verbatim). **`content` is usually an ARRAY of blocks** —
+    flatten it to text yourself in `anthropic.ts` (join `text` blocks; describe image blocks) BEFORE
+    building the OpenAI `tool` message (do NOT pass raw Anthropic blocks — `contentToTextAndImages`
+    would `JSON.stringify` them into garbage). If `is_error:true`, prefix the text with an error
+    marker so Composer knows the tool failed.
 - `tools[]` (`{name, description, input_schema}`) → OpenAI tools (`{type:"function", function:{name,
   description, parameters: input_schema}}`).
+- `tool_choice` → translate: Anthropic `auto` → omit; `any` → `"required"`; `{type:"tool",name}` →
+  `{type:"function",function:{name}}`; `none` → `"none"`.
 - Params: `max_tokens` (required by Anthropic) → carried/ignored as the OpenAI path allows;
   `temperature`, `stop_sequences` → mapped where supported; `stream` → drives SSE vs object.
 
@@ -84,18 +102,28 @@ Consume the `CursorTextEvent` stream (`text` | `tool_call` | `done`).
   "stop_reason": "end_turn" | "tool_use", "stop_sequence": null,
   "usage": {"input_tokens": N, "output_tokens": M} }
 ```
-`stop_reason` = `tool_use` when a `tool_call` was emitted, else `end_turn`.
+`stop_reason` = `tool_use` when a `tool_call` was emitted, else `end_turn`. (review S7) We only
+ever emit `end_turn` or `tool_use`; we never synthesize `max_tokens`/`stop_sequence` (Composer
+doesn't surface them). This is correct for Claude Code's loop — it continues on `tool_use`, stops
+on `end_turn`.
 
-**Streaming SSE** (exact event order Claude Code expects), each as `event: <type>\ndata: <json>\n\n`:
-1. `message_start` — `{message:{id,type,role,model,content:[],stop_reason:null,usage:{input_tokens:N,output_tokens:0}}}`
-2. For text: `content_block_start` (index 0, `{type:"text",text:""}`) → one or more
-   `content_block_delta` (`{type:"text_delta", text:"…"}`) → `content_block_stop`.
-3. For a tool call: `content_block_start` (next index, `{type:"tool_use", id, name, input:{}}`) →
-   `content_block_delta` (`{type:"input_json_delta", partial_json:"<args json>"}`) → `content_block_stop`.
-4. `message_delta` — `{delta:{stop_reason, stop_sequence:null}, usage:{output_tokens:M}}`.
-5. `message_stop`.
-   Also send SSE `ping` events are optional; we will emit `message_start` immediately so Claude Code
-   sees the stream open before the bridge's first token.
+**Streaming SSE** (review: B2, B4, S1, S2, S3, S6) — a DEDICATED Anthropic pump (NOT
+`streamOpenAiEvents`, whose error/usage shapes are OpenAI's). Each event is
+`event: <type>\ndata: <json>\n\n`. Exact wire shapes (note top-level `index` + nested `delta`):
+1. `message_start` — `{"type":"message_start","message":{"id":"msg_…","type":"message","role":"assistant","model":"<requested>","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":N,"output_tokens":1}}}`
+2. Text block: `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` →
+   one+ `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"…"}}` →
+   `{"type":"content_block_stop","index":0}`.
+3. Tool call (only after the text block is stopped — blocks never interleave): the bridge emits the
+   full args in one shot, so emit `{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_…","name":"…","input":{}}}`
+   → ONE `{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"<JSON.stringify(args)>"}}`
+   (empty args → `partial_json:"{}"`) → `{"type":"content_block_stop","index":1}`.
+4. `{"type":"message_delta","delta":{"stop_reason":"end_turn"|"tool_use","stop_sequence":null},"usage":{"output_tokens":M}}`
+   — `output_tokens` here is the **CUMULATIVE total** for the whole message, not a per-event delta.
+5. `{"type":"message_stop"}`.
+   We skip `ping` (optional) and emit `message_start` immediately so the stream opens before the
+   bridge's first token. On mid-stream failure (after `message_start`), emit an Anthropic error event:
+   `event: error\ndata: {"type":"error","error":{"type":"api_error","message":"…"}}`.
 
 ## Tool flow
 
